@@ -20,3 +20,6 @@ The corresponding pot files are in the Blender project.
 3. Open the python script
 4. Ensure that the required pot models ("Bottom_to_Copy" and "TOP_to_Copy") are present in your Blender scene, the script will create the hanging structure. It might take some time to execute, you can check the Blender terminal to see if it runs.
 
+
+
+![Fractal Tree Example](https://github.com/Romu-Qua/haenge_topf/blob/master/rendered_model.png?raw=true)
