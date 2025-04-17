@@ -1,0 +1,554 @@
+import bpy
+import mathutils
+import random
+import math
+import numpy as np
+import bmesh
+# --- Conical Boundaries ---
+TREE_HEIGHT = 19  # Height of the outer cone
+BASE_RADIUS_OUTER = 9.4  # Outer cone base radius
+BASE_RADIUS_INNER = 9.1  # Inner cone base radius
+INNER_CONE_HEIGHT = 19.5  # Height of the inner cone
+MAX_BRANCH_RADIUS = 0.25  # Max cylinder radius
+
+# --- Branch Generation Parameters ---
+mean = 0.7  # Mean branch length factor
+Z_branch_offset = 0.06  # Vertical offset for child branches
+std_dev = 0.1  # Standard deviation for branch length randomness
+single_extender = 1  # Multiplier for single branches length
+#edge_loop_tolerance = MAX_BRANCH_RADIUS * np.sin(60 / 360 * 2 * np.pi) * 1.2  # Tolerance for edge loop vertex matching
+edge_loop_tolerance = 0.1
+direction_modifier = 0.96  # Modifier for branch length after the end point is constrained.
+
+# --- Depth Limits for Branching Phases ---
+depth_first_limiti = 8
+depth_second_limit = 18
+
+# --- Branching Probabilities per Phase ---
+def first_phase_branches_chance():
+    return np.random.choice([1, 2], p=[0.75, 0.25])
+
+def second_phase_branches_chance():
+    return np.random.choice([1, 2], p=[0.9, 0.1])
+
+def last_phase():
+    return np.random.choice([1, 2], p=[0.95, 0.05])
+
+# --- Angle Randomness per Phase ---
+angle_first_phase = 0.4
+angle_second_phase = 0.3
+
+# List to store created objects
+
+created_objects = []
+
+
+
+
+# List to store created objects
+created_objects = []
+
+
+
+
+
+def get_cone_radius(height, cone_height, base_radius):
+    """Returns the cone radius at a given height, assuming cone grows from tip to base."""
+    return base_radius * (height / cone_height)
+
+def get_cone_surface_direction(start):
+    """Returns the direction towards the base along the cone surface at the given height."""
+    # Radius at the current height on the cone surface
+    height_fraction = start.z / TREE_HEIGHT
+    max_radius = get_cone_radius(start.z, TREE_HEIGHT, BASE_RADIUS_OUTER)
+
+    # Direction pointing to the base of the cone, along the surface
+    direction = mathutils.Vector((start.x, start.y, -start.z)).normalized()  # Pointing downwards
+    direction *= max_radius / start.z  # Scale to the cone surface
+
+    return direction
+
+
+
+def get_cone_surface_normal(point):
+    """Returns the normal vector to the surface of the cone at the given point."""
+    # Cone parameters
+    cone_height = TREE_HEIGHT
+    base_radius = BASE_RADIUS_OUTER
+
+    # Calculate radius at this height on the cone
+    radius_at_height = get_cone_radius(point.z, cone_height, base_radius)
+
+    # Normal vector is pointing radially outward from the cone's axis
+    normal = mathutils.Vector((point.x, point.y, -radius_at_height))  # Vector pointing towards the base
+    normal.normalize()
+
+    return normal
+
+
+def adjust_z_value_if_angle_exceeds_threshold(vector, threshold_deg=60):
+    # Create a unit vector along the Z-axis (0, 0, 1)
+    z_axis = np.array([0, 0, 1])
+
+    # Normalize the vector to ensure it's a unit vector
+    vector_norm = vector / np.linalg.norm(vector)
+
+    # Calculate the cosine of the angle between the vector and the Z-axis
+    cosine_angle = np.dot(vector_norm, z_axis)
+
+    # Ensure the cosine value is within valid range (-1, 1) due to floating-point precision issues
+    cosine_angle = np.clip(cosine_angle, -1, 1)
+
+    # Calculate the angle in radians and convert to degrees
+    angle_rad = np.arccos(cosine_angle)
+    angle_deg = np.degrees(angle_rad)
+    
+
+    # Check if the angle exceeds the threshold
+    if angle_deg > threshold_deg:
+        # Add 1 to the Z value of the vector
+        #print("angle ", angle_deg)
+        return False
+
+    return True
+
+
+def get_edge_loop(obj, z_value, tolerance=edge_loop_tolerance):
+    """Finds edge loop vertex coordinates near a given z-coordinate in an object."""
+    if obj.type != 'MESH':
+        raise TypeError("Object must be a mesh.")
+
+    obj_matrix_world = obj.matrix_world
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+
+    edge_loop_coords = []
+    while len(edge_loop_coords) < 32:
+        tolerance += 0.03
+        edge_loop_coords = []
+        for v in bm.verts:
+            world_co = obj_matrix_world @ v.co
+            if abs(world_co.z - z_value) < tolerance:
+                #print(world_co)
+                edge_loop_coords.append(world_co.copy()) # Store vertex coordinates
+
+    bm.free() #free the bmesh
+    if len(edge_loop_coords) > 32:
+        if z_value < (TREE_HEIGHT-0.01):
+            pass
+            #assert False, "FUCKED UP LOOP SELECTION"
+    
+    print(" THIS MANY IN LOOP COORD: , ", len(edge_loop_coords))
+    return edge_loop_coords
+
+def clamp_angle_to_0_78_radians(angle_radians):
+    """
+    Takes an angle in radians, clamps its absolute value to 0.78 radians,
+    and returns the angle with its original sign.
+    """
+    original_sign = 1 if angle_radians >= 0 else -1
+    clamped_abs_value = min(abs(angle_radians), 0.78)
+    return clamped_abs_value * original_sign
+
+def create_branch(start, direction, depth=0, max_depth=5, mean=mean, Z_branch_offset = Z_branch_offset, std_dev = std_dev):
+    """Creates branches constrained between two full cones, with directions along cone surface."""
+    #if depth > max_depth or start.z >= TREE_HEIGHT:
+    if start.z >= TREE_HEIGHT:
+        return
+
+    height_fraction = np.max([start.z / TREE_HEIGHT, 0.3])  # Normalize height (0 at base, 1 at top)
+    
+    # Compute valid radial range at this height
+    max_radius = get_cone_radius(start.z, TREE_HEIGHT, BASE_RADIUS_OUTER)
+    min_radius = get_cone_radius(start.z, INNER_CONE_HEIGHT, BASE_RADIUS_INNER)
+
+    # Constrain the branch within the two cones
+    radius_2d = math.sqrt(start.x**2 + start.y**2)
+    #print("radius 2d ", radius_2d)
+    if radius_2d > max_radius:
+        scale_factor = max_radius / radius_2d
+        start.x *= scale_factor
+        start.y *= scale_factor
+    elif radius_2d < min_radius:
+        scale_factor = min_radius / radius_2d
+        start.x *= scale_factor
+        start.y *= scale_factor
+    
+    #print("fixed start, ", start)
+    # Branch properties
+    
+
+
+    # Generate a single sample
+    sample = np.random.normal(loc=mean, scale=std_dev)
+    
+    branch_length =  sample# * (1 - height_fraction)  # Shorter branches at top
+    branch_radius = MAX_BRANCH_RADIUS * np.max([1 - height_fraction])  # Tapering effect
+    branch_radius = max(branch_radius, 0.15)  # Prevent vanishingly small branches
+    #branch_radius *= np.random.uniform(0.9, 1.1)
+    direction = direction/ math.sqrt(direction.x**2+direction.y**2+direction.z**2) * branch_length
+    
+    
+    
+    
+    end = start + direction
+    
+    if end.z > INNER_CONE_HEIGHT:
+        end.z = INNER_CONE_HEIGHT
+
+    
+    max_radius = get_cone_radius(end.z, TREE_HEIGHT, BASE_RADIUS_OUTER)
+    min_radius = get_cone_radius(end.z, INNER_CONE_HEIGHT, BASE_RADIUS_INNER)
+
+    # Constrain end point within the two cones  
+    
+    end_radius_2d = math.sqrt(end.x**2 + end.y**2)
+    #print("end_radius before ", end_radius_2d)
+    if end_radius_2d > max_radius:
+        scale_factor = max_radius / end_radius_2d
+        end.x *= scale_factor
+        end.y *= scale_factor
+        #print("scale factor ,", scale_factor)
+    elif end_radius_2d < min_radius:
+        scale_factor = min_radius / end_radius_2d
+        end.x *= scale_factor
+        end.y *= scale_factor
+        
+    #print("end radius ", math.sqrt(end.x**2 + end.y**2), " max an mind ", max_radius, min_radius, height_fraction, start.z)
+    direction = end - start
+    
+    # now lets make sure that our angle is below 30 degree:
+    is_ok = adjust_z_value_if_angle_exceeds_threshold(direction)
+    
+    while not is_ok:
+        direction.z +=0.1
+        end = start + direction
+        
+        #print("Was not ok, ", depth) 
+        
+        max_radius = get_cone_radius(end.z, TREE_HEIGHT, BASE_RADIUS_OUTER)
+        min_radius = get_cone_radius(end.z, INNER_CONE_HEIGHT, BASE_RADIUS_INNER)
+        
+        end_radius_2d = math.sqrt(end.x**2 + end.y**2)
+        #print("end_radius before ", end_radius_2d)
+        if end_radius_2d > max_radius:
+            scale_factor = max_radius / end_radius_2d
+            end.x *= scale_factor
+            end.y *= scale_factor
+            #print("scale factor ,", scale_factor)
+        elif end_radius_2d < min_radius:
+            scale_factor = min_radius / end_radius_2d
+            end.x *= scale_factor
+            end.y *= scale_factor
+        direction = end - start        
+        is_ok = adjust_z_value_if_angle_exceeds_threshold(direction)
+        
+    
+
+    # Create a cylinder for the branch
+    #print("start_radius_before_creation ", math.sqrt(start.x**2 + start.y**2))
+    #print("end_radius_before_creation ", math.sqrt(end.x**2 + end.y**2))
+    mid = (start + end) / 2  # Cylinder midpoint
+    bpy.ops.mesh.primitive_cylinder_add(radius=branch_radius, depth=math.sqrt(direction.x**2+direction.y**2+direction.z**2)*direction_modifier, location=mid)
+    branch_obj = bpy.context.object
+    
+    # Print vertex coordinates and matrix_world IMMEDIATELY after creation
+    bm = bmesh.new()
+    bm.from_mesh(branch_obj.data)
+    #for v in bm.verts:
+    #    print(f"Local Vertex: {v.co}, World Vertex: {branch_obj.matrix_world @ v.co}")
+
+    #print("Branch_obj matrix_world (after creation):", branch_obj.matrix_world)
+
+    bm.free()
+
+    # Align the cylinder to the branch direction
+    branch_obj.rotation_mode = 'QUATERNION'
+    branch_obj.rotation_quaternion = direction.to_track_quat('Z', 'Y')
+    
+    
+    
+
+    created_objects.append(branch_obj)
+    
+     # Store end vertices for smooth connections
+
+    #print("FOUND EDGE LOOP OF PARENT?, ", len(lower_edge_loop) > 3)
+
+
+    # Generate child branches
+    #num_branches = random.randint(1, 3)
+    
+    if 2 < depth < depth_first_limiti:
+        num_branches = first_phase_branches_chance()        
+    elif depth_second_limit > depth > depth_first_limiti:
+        num_branches = second_phase_branches_chance()
+    else:
+        num_branches = last_phase()
+    
+    
+
+    
+    child_objects = []
+
+    for l in range(num_branches):
+        # Introduce slight randomness within the surface plane
+        
+        if depth < depth_first_limiti:
+            random_angle = (1-np.random.normal(loc=0, scale=std_dev))*angle_first_phase * np.random.choice([1,-1])
+        else:
+            random_angle = (1-np.random.normal(loc=0, scale=std_dev))*angle_second_phase * np.random.choice([1,-1])
+        
+        if num_branches ==2:
+            random_angle = clamp_angle_to_0_78_radians(random_angle)    
+        
+        surface_normal = get_cone_surface_normal(start)
+        random_axis = surface_normal  # Use surface normal as rotation axis
+
+
+        # Create a rotation matrix around the random axis
+        rotation_matrix = mathutils.Matrix.Rotation(random_angle, 4, random_axis)
+
+        # Apply the rotation matrix to the direction vector
+        new_dir = direction.copy()
+        if num_branches == 1:
+            direction*=single_extender
+        new_dir = rotation_matrix @ new_dir  # Apply rotation matrix to direction vector
+        
+        #print("new dir, ", new_dir)
+        #print("end of this, ", end)
+
+        
+        #create_branch(end, new_dir, depth + 1, max_depth)
+        new_end = end.copy()
+        new_end.z += Z_branch_offset*l
+        child_obj = create_branch(new_end, new_dir, depth + 1, max_depth)
+        if child_obj:
+            child_objects.append(child_obj)
+
+    if child_objects:
+        upper_edge_coords = get_edge_loop(branch_obj, end.z)
+        for k, child in enumerate(child_objects):
+            print("CHILD")
+            #if k > 0:
+            #    continue
+            # Get edge loop coordinates BEFORE joining
+
+            
+            child.update_tag()
+            child.data.update()
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            depsgraph.update()
+            
+            
+            lower_edge_coords = get_edge_loop(child, end.z)
+            
+            print("VERTICES IN EDGE COORDS ", len(lower_edge_coords), len(upper_edge_coords))
+            #print("VERTICES IN EDGE COORDS examples ", lower_edge_coords[0], upper_edge_coords[0])
+            print("THE HEIGHT OF INTERSECTION ", end.z)
+
+            # Join the objects now
+            bpy.ops.object.select_all(action='DESELECT')
+            branch_obj.select_set(True)
+            child.select_set(True)
+            bpy.context.view_layer.objects.active = branch_obj
+            
+            print("Origin before join:", branch_obj.location)
+
+            bpy.ops.object.join()
+            branch_obj = bpy.context.view_layer.objects.active  # Update branch_obj reference
+            
+                        # Update the created_objects list
+            #created_objects.remove(branch_obj)
+            created_objects.remove(child)
+            #created_objects.append(joined_obj)
+            
+            print("Origin after join:", branch_obj.location)
+
+
+            if lower_edge_coords and upper_edge_coords:
+                print("BRIDGING")
+                bpy.ops.object.mode_set(mode='EDIT')
+                # Deselect and count before selecting any verts
+                #assert len(selected_verts) == 0
+
+
+                bm = bmesh.from_edit_mesh(bpy.context.object.data)
+
+                tolerance = 1e-4  # Adjust tolerance as needed
+
+                lower_edge_verts = []
+                for i, v in enumerate(bm.verts):
+                    world_v_co = branch_obj.matrix_world @ v.co  # transform to world space.
+                    #world_v_co = v.co  # transform to world space.
+                    found_match = False
+                    for j, coord in enumerate(lower_edge_coords):                        
+                                                
+                        if j == 0:
+                            pass
+                            #print(world_v_co, coord)
+                        
+                        if (world_v_co - coord).length < tolerance:
+                            lower_edge_verts.append(v)
+                            found_match = True
+                            break
+                    if not found_match:
+                        pass
+
+                if k > 0:  # If not the first child
+                    bm = bmesh.from_edit_mesh(bpy.context.object.data)
+                    upper_edge_verts_copy = []
+                    tolerance = 1e-4
+
+                    # Create new vertices based on the existing edge loop coordinates
+                    for coord in upper_edge_coords:
+                        v_new = bm.verts.new(branch_obj.matrix_world.inverted() @ coord) # convert world coordinates to object coordinates
+                        upper_edge_verts_copy.append(v_new)
+                        
+                    # Create a face for the new edge loop
+                    if len(upper_edge_verts_copy) >= 3:  # Ensure enough vertices for a face
+                        try:
+                            bm.faces.new(upper_edge_verts_copy)
+                        except ValueError: # catch the value error if the face cannot be created.
+                            print("Warning: face creation failed (likely non-planar edge loop)")
+
+
+                    upper_edge_verts = upper_edge_verts_copy
+                    bmesh.update_edit_mesh(bpy.context.object.data)
+
+                else:
+                    upper_edge_verts = []
+                    # ... (original upper_edge_verts finding) ...
+                    bm = bmesh.from_edit_mesh(bpy.context.object.data)
+                    tolerance = 1e-4
+                    for i, v in enumerate(bm.verts):
+                        world_v_co = branch_obj.matrix_world @ v.co
+                        found_match = False
+                        for j, coord in enumerate(upper_edge_coords):
+                            if (world_v_co - coord).length < tolerance:
+                                upper_edge_verts.append(v)
+                                found_match = True
+                                break
+                        if not found_match:
+                            pass
+                    bmesh.update_edit_mesh(bpy.context.object.data)
+
+                print("VERTICES IN EDGE LOOPS ", len(lower_edge_verts), len(upper_edge_verts))
+
+                # Check if there is any overlap between the two vertex lists
+                if any(v in upper_edge_verts for v in lower_edge_verts):
+                    print("ERROR: Lower and upper edge vertex lists share vertices!")
+                    return  # Stop the code, there is an error.
+                
+                
+                #bpy.ops.object.select_all(action='DESELECT')
+
+
+
+                
+                #selected_verts = [v for v in bpy.context.object.data.vertices if v.select]
+                #print(f"Number of selected vertices: {len(selected_verts)}")                
+                #assert False
+                #print("VERTICES IN EDGE LOOPS ", lower_edge_verts)
+                
+
+                # Deselect mesh components in Edit Mode (if applicable)
+                if bpy.context.object and bpy.context.object.mode == 'EDIT':
+                    bpy.ops.mesh.select_all(action='DESELECT')
+
+
+
+
+
+
+                #Deselect Armature points, in edit mode.
+                bpy.ops.mesh.select_mode(type="VERT")
+
+                #bpy.ops.object.mode_set(mode='EDIT')
+                #bpy.ops.object.select_all(action='DESELECT')
+                #assert False
+
+                for v in lower_edge_verts:
+                    v.select = True
+                for v in upper_edge_verts:
+                    v.select = True
+                    
+                #selected_verts = [v for v in bpy.context.object.data.vertices if v.select]
+                #print(f"Number of selected vertices: {len(selected_verts)}")
+                bmesh.update_edit_mesh(bpy.context.object.data)  # update the mesh
+                
+                #assert False
+                
+                #if k == 1:
+                #    assert False
+
+                bmesh.update_edit_mesh(bpy.context.object.data)  # update the mesh
+
+                bpy.ops.mesh.bridge_edge_loops() #bridge the edge loops
+                bpy.ops.mesh.bridge_edge_loops()
+                bpy.ops.object.mode_set(mode='OBJECT') # switch back to object mode.
+                
+                #assert False
+
+            else:
+                print("COULDNT GET THE EDGE LOOPS")
+
+        
+    else:
+        print("NO CHILD OBJECTS")
+    return branch_obj
+
+
+# --- Generate the fractal tree ---
+create_branch(mathutils.Vector((0.001, 0.0015, 0)), mathutils.Vector((1, 1.5, 1)), depth=0, max_depth=10)
+# --- Generate the fractal tree ---
+create_branch(mathutils.Vector((-0.001, -0.0015, 0)), mathutils.Vector((-1.5, -1.5, 1)), depth=0, max_depth=15)
+create_branch(mathutils.Vector((-0.001, -0.0015, 0)), mathutils.Vector((-1.5, -1, 1)), depth=0, max_depth=15)
+#create_branch(mathutils.Vector((0.001, -0.0015, 0)), mathutils.Vector((1.5, -1.5, 1)), depth=0, max_depth=15)
+# --- Join all branches into a single mesh ---
+
+for obj in created_objects:
+    obj.select_set(True)    
+bpy.context.view_layer.objects.active = created_objects[0]
+bpy.ops.object.join()
+
+# --- Clean up the mesh ---
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.remove_doubles(threshold=0.001)
+bpy.ops.mesh.normals_make_consistent(inside=False)
+bpy.ops.object.mode_set(mode='OBJECT')
+
+
+# --- Mirror the object across the XY plane ---
+#bpy.context.object.scale = (1, 1, -1)  # Mirror along the Z-axis
+
+# --- Move the mirrored object to z = 20 ---
+bpy.context.object.location.z = 20  # Set the Z-location to 20
+bpy.context.object.rotation_mode = 'XYZ'  # Ensure the rotation mode is set to Euler XYZ
+bpy.ops.transform.rotate(value=math.radians(180), orient_axis='X')
+
+
+pot_obj = bpy.data.objects.get("Bottom")
+if pot_obj:
+    pot_obj.select_set(True)  # Select the pot object
+    bpy.context.view_layer.objects.active = bpy.context.view_layer.objects.active  # Keep the current active object
+    bpy.ops.object.join()  # Merge the pot object into the current object
+else:
+    print("Object 'pot' not found.")
+    
+
+pot_obj = bpy.data.objects.get("TOP")
+if pot_obj:
+    pot_obj.select_set(True)  # Select the pot object
+    bpy.context.view_layer.objects.active = bpy.context.view_layer.objects.active  # Keep the current active object
+    bpy.ops.object.join()  # Merge the pot object into the current object
+else:
+    print("Object 'top' not found.")
+
+# --- Clean up the merged object (including 'pot') ---
+#bpy.ops.object.mode_set(mode='EDIT')  # Switch to Edit mode
+#bpy.ops.mesh.remove_doubles(threshold=0.001)  # Remove duplicate vertices
+#bpy.ops.mesh.normals_make_consistent(inside=False)  # Make normals consistent
+#bpy.ops.object.mode_set(mode='OBJECT')  # Switch back to Object mode
+
+print("Fractal tree constrained between two full cones (growing from tip up) with surface-constrained directions, ready for 3D printing!")
